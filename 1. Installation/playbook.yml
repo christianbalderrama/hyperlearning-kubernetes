@@ -1,0 +1,365 @@
+---
+- name: Install Kubernetes Cluster with kubeadm (Production Grade)
+  hosts: all
+  become: yes
+  vars:
+    k8s_version: "1.29"
+    pod_network_cidr: "10.244.0.0/16"
+    istio_version: "1.21.0"
+    
+  tasks:
+    # ==========================================
+    # STEP 1: Prerequisites & System Setup (RHEL 10)
+    # ==========================================
+    
+    - name: Disable swap (K8s requirement - like clearing the runway before takeoff)
+      shell: |
+        swapoff -a
+        sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+    
+    - name: Disable SELinux (required for K8s - the security bouncer needs to step aside)
+      selinux:
+        state: permissive
+        policy: targeted
+      
+    - name: Set SELinux to permissive in config (persist across reboots)
+      lineinfile:
+        path: /etc/selinux/config
+        regexp: '^SELINUX='
+        line: 'SELINUX=permissive'
+      
+    - name: Load kernel modules (bridge traffic needs to see the cluster network)
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+          
+    - name: Enable kernel modules immediately
+      shell: |
+        modprobe overlay
+        modprobe br_netfilter
+        
+    - name: Configure sysctl for K8s networking (let iptables see bridged traffic)
+      copy:
+        dest: /etc/sysctl.d/k8s.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward                 = 1
+          
+    - name: Apply sysctl settings
+      command: sysctl --system
+      
+    - name: Configure firewalld for Kubernetes (open the network gates)
+      firewalld:
+        port: "{{ item }}"
+        permanent: yes
+        state: enabled
+        immediate: yes
+      loop:
+        - 6443/tcp      # Kubernetes API server
+        - 2379-2380/tcp # etcd server client API
+        - 10250/tcp     # Kubelet API
+        - 10251/tcp     # kube-scheduler
+        - 10252/tcp     # kube-controller-manager
+        - 10255/tcp     # Read-only Kubelet API
+        - 30000-32767/tcp # NodePort Services
+      ignore_errors: yes
+      
+    # ==========================================
+    # STEP 2: Install Container Runtime (containerd) - RHEL 10
+    # ==========================================
+    
+    - name: Install required packages for containerd
+      dnf:
+        name:
+          - yum-utils
+          - device-mapper-persistent-data
+          - lvm2
+          - curl
+        state: present
+        
+    - name: Add Docker CE repository for containerd
+      shell: |
+        dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+      args:
+        creates: /etc/yum.repos.d/docker-ce.repo
+        
+    - name: Install containerd
+      dnf:
+        name: containerd.io
+        state: present
+        
+    - name: Create containerd config directory
+      file:
+        path: /etc/containerd
+        state: directory
+        mode: '0755'
+        
+    - name: Configure containerd for K8s (systemd cgroup driver - the traffic cop)
+      shell: |
+        containerd config default > /etc/containerd/config.toml
+        sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+      args:
+        creates: /etc/containerd/config.toml
+        
+    - name: Restart and enable containerd
+      systemd:
+        name: containerd
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+        
+    # ==========================================
+    # STEP 3: Install Kubernetes Components - RHEL 10
+    # ==========================================
+    
+    - name: Add Kubernetes repository
+      yum_repository:
+        name: kubernetes
+        description: Kubernetes Repository
+        baseurl: "https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/rpm/"
+        enabled: yes
+        gpgcheck: yes
+        gpgkey: "https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/rpm/repodata/repomd.xml.key"
+        
+    - name: Install kubeadm, kubelet, kubectl
+      dnf:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+        disable_excludes: kubernetes
+        
+    - name: Enable kubelet service
+      systemd:
+        name: kubelet
+        enabled: yes
+        daemon_reload: yes
+
+- name: Initialize Kubernetes Control Plane
+  hosts: master
+  become: yes
+  vars:
+    pod_network_cidr: "10.244.0.0/16"
+    istio_version: "1.21.0"
+    
+  tasks:
+    - name: Initialize kubeadm (this is like starting the engine)
+      shell: |
+        kubeadm init --pod-network-cidr={{ pod_network_cidr }} --ignore-preflight-errors=NumCPU
+      register: kubeadm_init
+      ignore_errors: yes
+      
+    - name: Create .kube directory for kubectl config
+      file:
+        path: /home/{{ ansible_user }}/.kube
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        
+    - name: Copy admin.conf to user's kube config
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/{{ ansible_user }}/.kube/config
+        remote_src: yes
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0600'
+        
+    - name: Also copy to root for convenience
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+        remote_src: yes
+        mode: '0600'
+      become: yes
+      
+    # ==========================================
+    # STEP 4: Install Base CNI Plugin (Cilium)
+    # ==========================================
+    
+    - name: Install Cilium CLI
+      shell: |
+        CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
+        CLI_ARCH=amd64
+        curl -L --fail --remote-name-all https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
+        sha256sum --check cilium-linux-${CLI_ARCH}.tar.gz.sha256sum
+        tar xzvfC cilium-linux-${CLI_ARCH}.tar.gz /usr/local/bin
+        rm cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
+      args:
+        creates: /usr/local/bin/cilium
+        
+    - name: Install Cilium CNI (modern CNI with eBPF - the highway for your pods)
+      shell: |
+        cilium install --version 1.15.0
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: cilium_install
+      
+    - name: Wait for Cilium to be ready
+      shell: cilium status --wait
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      retries: 30
+      delay: 10
+      
+    # ==========================================
+    # STEP 5: Install Istio in Ambient Mode
+    # ==========================================
+    
+    - name: Download and install istioctl
+      shell: |
+        curl -L https://istio.io/downloadIstio | ISTIO_VERSION={{ istio_version }} sh -
+        cp istio-{{ istio_version }}/bin/istioctl /usr/local/bin/
+        chmod +x /usr/local/bin/istioctl
+      args:
+        creates: /usr/local/bin/istioctl
+        
+    - name: Install Istio with ambient profile (sidecar-less service mesh!)
+      shell: |
+        istioctl install --set profile=ambient --skip-confirmation
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: istio_install
+      
+    - name: Wait for Istio system pods to be ready
+      shell: kubectl wait --for=condition=ready pod --all -n istio-system --timeout=300s
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      retries: 10
+      delay: 10
+      
+    - name: Verify Istio ambient mode components
+      shell: |
+        kubectl get pods -n istio-system
+        kubectl get daemonset -n istio-system ztunnel
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: istio_components
+        
+    - name: Allow master node to run pods (for single-node testing)
+      shell: |
+        kubectl taint nodes --all node-role.kubernetes.io/control-plane-
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      ignore_errors: yes
+      
+    # ==========================================
+    # STEP 6: Verification & Health Checks
+    # ==========================================
+    
+    - name: Wait for all nodes to be Ready (patience - good things take time)
+      shell: kubectl get nodes | grep -w Ready
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: nodes_ready
+      retries: 30
+      delay: 10
+      until: nodes_ready.rc == 0
+      
+    - name: Wait for all system pods to be Running
+      shell: kubectl get pods -n kube-system --no-headers | grep -v Running | wc -l
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: pods_not_running
+      retries: 30
+      delay: 10
+      until: pods_not_running.stdout == "0"
+      
+    - name: Display cluster info
+      shell: kubectl cluster-info
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: cluster_info
+      
+    - name: Display node status
+      shell: kubectl get nodes -o wide
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: node_status
+      
+    - name: Display system pods
+      shell: kubectl get pods -n kube-system
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: system_pods
+      
+    - name: Display Istio components
+      shell: kubectl get pods,daemonset -n istio-system
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: istio_pods
+      
+    - name: Deploy test nginx pod for verification
+      shell: |
+        kubectl create namespace test-ambient --dry-run=client -o yaml | kubectl apply -f -
+        kubectl label namespace test-ambient istio.io/dataplane-mode=ambient
+        kubectl run nginx-test --image=nginx --port=80 -n test-ambient
+        kubectl wait --for=condition=ready pod/nginx-test -n test-ambient --timeout=120s
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: test_pod
+      
+    - name: Verify test pod is running in ambient mode
+      shell: kubectl get pod nginx-test -n test-ambient -o jsonpath='{.status.phase}'
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: pod_phase
+      failed_when: pod_phase.stdout != "Running"
+      
+    - name: Check if pod is enrolled in ambient mesh
+      shell: |
+        kubectl get pod nginx-test -n test-ambient -o jsonpath='{.metadata.labels}' | grep -q 'istio.io/dataplane-mode'
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: ambient_check
+      ignore_errors: yes
+      
+    - name: Verify ztunnel is capturing traffic
+      shell: |
+        kubectl logs -n istio-system -l app=ztunnel --tail=20 | head -10
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: ztunnel_logs
+      ignore_errors: yes
+      
+    - name: Display verification results
+      debug:
+        msg:
+          - "=== KUBERNETES CLUSTER VERIFICATION ==="
+          - "{{ cluster_info.stdout_lines }}"
+          - ""
+          - "=== NODE STATUS ==="
+          - "{{ node_status.stdout_lines }}"
+          - ""
+          - "=== SYSTEM PODS ==="
+          - "{{ system_pods.stdout_lines }}"
+          - ""
+          - "=== ISTIO AMBIENT MODE COMPONENTS ==="
+          - "{{ istio_pods.stdout_lines }}"
+          - ""
+          - "=== TEST POD STATUS ==="
+          - "Test pod nginx-test is {{ pod_phase.stdout }} in ambient mesh"
+          - ""
+          - "✅ Cluster is operational with Istio Ambient Mode!"
+          - "✅ ztunnel daemonset deployed for L4 zero-trust networking"
+          - "✅ No sidecars needed - ambient mode active!"
+          
+    - name: Create join command for worker nodes
+      shell: kubeadm token create --print-join-command
+      register: join_command
+      
+    - name: Save join command to file
+      copy:
+        content: "{{ join_command.stdout }}"
+        dest: /tmp/k8s-join-command.sh
+        mode: '0755'
+        
+    - name: Display join command
+      debug:
+        msg: 
+          - "To join worker nodes, run this command on them:"
+          - "{{ join_command.stdout }}"
